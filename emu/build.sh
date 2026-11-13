@@ -46,7 +46,7 @@ if [ ! -d "$P/include/glib-2.0" ]; then
     M=https://packages.termux.dev/apt/termux-main
     curl -fsSL "$M/dists/stable/main/binary-aarch64/Packages" -o "$W/Packages"
     for pkg in glib pcre2 libffi libiconv libandroid-support zlib libpixman libpng libjpeg-turbo libgnutls libnettle libgmp \
-               libidn2 libunistring libtasn1 libcurl openssl zstd libsnappy liblzo capstone libslirp dtc libbz2 ndk-sysroot; do
+               libidn2 libunistring libtasn1 libcurl openssl libnghttp2 libnghttp3 libngtcp2 libssh2 p11-kit zstd libsnappy liblzo capstone libslirp dtc libbz2 ndk-sysroot; do
         f=$(awk -v p="$pkg" '$1=="Package:"{ok=($2==p)} ok&&$1=="Filename:"{print $2; exit}' "$W/Packages")
         [ -n "$f" ] || { echo "no Termux package $pkg" >&2; exit 1; }
         curl -fsSL "$M/$f" -o "$W/debs/$pkg.deb"
@@ -120,7 +120,7 @@ AR=$TC/llvm-ar NM=$TC/llvm-nm OBJCOPY=$TC/llvm-objcopy RANLIB=$TC/llvm-ranlib ST
 "$W/qemu/configure" --target-list=aarch64-softmmu --cross-prefix=aarch64-linux-android- --cpu=aarch64 \
     --cc="$W/bin/a64-clang" --cxx="$W/bin/a64-clang++" --host-cc=gcc \
     --extra-cflags="-O2 -fno-emulated-tls -I$P/include" --extra-ldflags="-L$P/lib -L$W/stub -Wl,-rpath-link,$P/lib" \
-    --enable-reims-vgpu --disable-docs --disable-werror --disable-guest-agent --disable-tools \
+    --enable-reims-vgpu --enable-gnutls --enable-curl --disable-docs --disable-werror --disable-guest-agent --disable-tools \
     --disable-vnc-sasl --disable-linux-aio --disable-linux-io-uring --disable-kvm \
     --disable-vhost-user --disable-vhost-net --disable-vhost-kernel --disable-vhost-crypto --disable-vhost-vdpa \
     --disable-vhost-user-blk-server \
