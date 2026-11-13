@@ -21,6 +21,12 @@ import java.util.Locale;
  * the phone's own Vulkan driver is probed too, for the log: what it lacks is what support for it
  * (Mali, say) would need. iOS 16 does not use the GPU and is not gated.
  * <p>
+ * On a phone with no Adreno (a Pixel 10's PowerVR DXT, Tensor G5) the phone's own driver can pass instead: when its
+ * probe runs every test (or lacks only what {@link #FALLBACK_COVERS} lists) the check passes with
+ * {@link #systemDriver}, and Guest.start26 has QEMU load the phone's libvulkan.so instead of the Khronos loader
+ * and Turnip. Such a pass is keyed to the phone's build too (Build.FINGERPRINT): a system update, which can bring a
+ * new driver, checks again.
+ * <p>
  * A Turnip that lacks only sparse binds from host memory (Adreno 750, 2026-11: the binds are accepted but read
  * back zeros) passes in a compatibility mode ({@link #FALLBACK_COVERS}, {@link #noSparse}): iOS 26 and watchOS
  * then start with reims' deferred views off (REIMS_VGPU_DEFERRED_VIEWS=0, Guest.start26), the older path that
@@ -41,13 +47,22 @@ final class GpuCheck {
         return new File("/dev/kgsl-3d0").exists();
     }
 
-    /** What a pass is good for: this app build and its Turnip (a new build checks again). */
+    /** An Imagination PowerVR GPU (its services device; the Pixel 10's Tensor G5 has one). */
+    static boolean powervr() {
+        return new File("/dev/pvrsrvkm").exists();
+    }
+
+    /**
+     * What a pass is good for: this app build and its Turnip (a new build checks again); on a phone without an
+     * Adreno, whose pass can only be its own driver's, the phone's build too (a system update can change the driver).
+     */
     private static String key(Context c) {
         long turnip = new File(c.getApplicationInfo().nativeLibraryDir, "lib_libvulkan_freedreno.so.so").length();
+        String phone = adreno() ? "" : "/" + Build.FINGERPRINT;
         try {
-            return c.getPackageManager().getPackageInfo(c.getPackageName(), 0).getLongVersionCode() + "/" + turnip;
+            return c.getPackageManager().getPackageInfo(c.getPackageName(), 0).getLongVersionCode() + "/" + turnip + phone;
         } catch (android.content.pm.PackageManager.NameNotFoundException e) {
-            return "?/" + turnip;
+            return "?/" + turnip + phone;
         }
     }
 
@@ -99,9 +114,20 @@ final class GpuCheck {
         return passed(c) && key(c).equals(c.getSharedPreferences("setup", Context.MODE_PRIVATE).getString("gpucheck-nosparse", ""));
     }
 
+    /**
+     * The pass for this build is the phone's own Vulkan driver's (no Adreno, so no Turnip: a PowerVR, say): iOS 26 and
+     * watchOS start with the phone's libvulkan.so instead of the app's loader and Turnip (Guest.start26). Keyed like
+     * the pass.
+     */
+    static boolean systemDriver(Context c) {
+        return passed(c) && key(c).equals(c.getSharedPreferences("setup", Context.MODE_PRIVATE).getString("gpucheck-system", ""));
+    }
+
     /** The last check's outcome, for the screen. */
     static final class Result {
         boolean pass;
+        /** A pass of the phone's own driver (no Adreno): iOS 26 runs on it, not on Turnip. */
+        boolean system;
         /** A pass in the compatibility mode: Turnip lacks only what {@link #FALLBACK_COVERS} lists. */
         boolean nosparse;
         boolean ran;
@@ -282,8 +308,9 @@ final class GpuCheck {
             }
             Result r = last(c);
             c.getSharedPreferences("setup", Context.MODE_PRIVATE).edit().putString("gpucheck-pass", r.pass ? key(c) : "")
-                    .putString("gpucheck-nosparse", r.nosparse ? key(c) : "").apply();
-            AppLog.note(c, "gpu check: " + (r.nosparse ? "pass in the compatibility mode (no " + SPARSE_HOST + ")"
+                    .putString("gpucheck-nosparse", r.nosparse ? key(c) : "")
+                    .putString("gpucheck-system", r.system ? key(c) : "").apply();
+            AppLog.note(c, "gpu check: " + (r.system ? "the phone's own driver, " : "") + (r.nosparse ? "pass in the compatibility mode (no " + SPARSE_HOST + ")"
                     : r.pass ? "pass" : (r.never ? "will not run here: " : "not supported yet: ") + String.join("; ", r.why))
                     + " (turnip " + turnipEnd + ")");
             return r;
@@ -428,7 +455,8 @@ final class GpuCheck {
         String soc = Build.VERSION.SDK_INT >= 31 ? Build.SOC_MANUFACTURER + " " + Build.SOC_MODEL : "";
         rep.append("soc: ").append(soc).append(" / board ").append(Build.BOARD).append(" / hardware ").append(Build.HARDWARE)
                 .append(" / ro.soc.model ").append(prop("ro.soc.model")).append('\n');
-        rep.append("gpu device: ").append(adreno() ? "/dev/kgsl-3d0 (Adreno)" : new File("/dev/mali0").exists() ? "/dev/mali0 (Mali)" : "neither kgsl nor mali")
+        rep.append("gpu device: ").append(adreno() ? "/dev/kgsl-3d0 (Adreno)" : new File("/dev/mali0").exists() ? "/dev/mali0 (Mali)"
+                : powervr() ? "/dev/pvrsrvkm (PowerVR)" : "neither kgsl, mali nor pvrsrvkm")
                 .append(", ro.hardware.vulkan ").append(prop("ro.hardware.vulkan")).append(", ro.hardware.egl ").append(prop("ro.hardware.egl")).append('\n');
         rep.append("cpu: ").append(Build.SUPPORTED_ABIS[0]).append(", ").append(Runtime.getRuntime().availableProcessors())
                 .append(" cores; native engine needs: ").append(Guest.nativeMissing().isEmpty() ? "all there" : Guest.nativeMissing()).append('\n');
@@ -438,13 +466,18 @@ final class GpuCheck {
         // Turnip's own lacks and tests, for the compatibility mode (fallbackPass)
         List<String> lacks = new ArrayList<>(), tests = new ArrayList<>();
         boolean probeEnded = false;
+        // the phone's own driver's, for a pass without Turnip (no Adreno)
+        List<String> sysLacks = new ArrayList<>(), sysTests = new ArrayList<>();
+        boolean sysEnded = false, sysPass = false;
+        boolean own = !adreno() && !turnipOff(c);
         for (String which : new String[] {"turnip", "system"}) {
             File log = new File(d, which + ".log");
             if (!log.isFile()) {
                 continue;
             }
             r.ran = true;
-            rep.append("\n== ").append("turnip".equals(which) ? "the app's Turnip driver (what iOS 26 uses)" : "the phone's own Vulkan driver (for the log)").append('\n');
+            rep.append("\n== ").append("turnip".equals(which) ? "the app's Turnip driver (what iOS 26 uses)"
+                    : own ? "the phone's own Vulkan driver (what iOS 26 uses on this phone, no Adreno)" : "the phone's own Vulkan driver (for the log)").append('\n');
             try {
                 for (String l : Files.readAllLines(log.toPath())) {
                     rep.append(l).append('\n');
@@ -452,6 +485,16 @@ final class GpuCheck {
                         sysLines.add(l);
                         if (l.startsWith("gpu: ") && gpu.isEmpty()) {
                             gpu = l.substring(5);
+                        } else if (l.startsWith("driver: ") && driver.isEmpty()) {
+                            driver = l.substring(8);
+                        } else if (l.startsWith("result: ")) {
+                            sysPass = l.endsWith("pass");
+                        } else if (l.startsWith("lacks: ")) {
+                            sysLacks.add(l.substring(7));
+                        } else if (l.startsWith("missing: ")) {
+                            sysEnded = true;
+                        } else if (l.startsWith("test: ")) {
+                            sysTests.add(l.substring(6));
                         }
                         continue;
                     }
@@ -480,11 +523,22 @@ final class GpuCheck {
             r.pass = true;
             r.nosparse = true;
         }
+        // no Adreno: the phone's own driver (a Pixel 10's PowerVR) passes on the same terms as Turnip
+        if (r.ran && !r.pass && own && (sysPass || fallbackPass(sysLacks, sysTests, sysEnded))) {
+            r.pass = true;
+            r.system = true;
+            r.nosparse = !sysPass;
+            r.missing.clear();
+            r.missing.addAll(sysLacks);
+        }
         if (r.ran) {
             judge(c, r, sysLines, adreno() && !turnipOff(c));
             rep.append("\n== verdict\n");
             rep.append(String.format(Locale.ROOT, "ram: %.2f GB (a warning below %.1f for iOS 26, %.1f for watchOS; guest memory iOS 26 %d MiB, watchOS %d MiB)%n",
                     r.ram / 1e9, RAM_IOS26 / 1e9, RAM_WATCH / 1e9, Guest.ramMiB(c, Guest.IOS26), Guest.ramMiB(c, Guest.WATCH)));
+            if (r.system) {
+                rep.append("driver used: the phone's own (libvulkan.so), not Turnip\n");
+            }
             rep.append("result: ").append(r.nosparse ? "supported in the compatibility mode (no " + SPARSE_HOST
                     + ": reims' deferred views off, REIMS_VGPU_DEFERRED_VIEWS=0)"
                     : r.pass ? "supported" : r.never ? "will not run on this phone (with its current driver)" : "not supported yet")

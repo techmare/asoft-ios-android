@@ -265,6 +265,36 @@ final class Guest {
         return json;
     }
     /**
+     * The phone's own Vulkan (no Adreno, a GPU check passed on its driver: GpuCheck.systemDriver): a folder put before
+     * the app's links in QEMU's LD_LIBRARY_PATH whose libvulkan.so is the system's, so metal2vulkan's dlopen of
+     * libvulkan.so gets Android's loader and the vendor driver (a Pixel 10's PowerVR) instead of the Khronos loader
+     * and Turnip.
+     */
+    static File systemVulkanDir(Context c) throws IOException {
+        File d = new File(c.getFilesDir(), "vulkan-system");
+        d.mkdirs();
+        File sys = new File("/system/lib64/libvulkan.so");
+        if (!sys.exists()) {
+            throw new IOException("this phone has no " + sys);
+        }
+        File link = new File(d, "libvulkan.so");
+        try {
+            if (!sys.getPath().equals(android.system.Os.readlink(link.getPath()))) {
+                link.delete();
+                android.system.Os.symlink(sys.getPath(), link.getPath());
+            }
+        } catch (android.system.ErrnoException e) {
+            link.delete();
+            try {
+                android.system.Os.symlink(sys.getPath(), link.getPath());
+            } catch (android.system.ErrnoException e2) {
+                throw new IOException("symlink " + link, e2);
+            }
+        }
+        return d;
+    }
+
+    /**
      * The quick-boot state's name inside the user disk (qcow2 internal snapshot). It lives in one of
      * two slots, QUICK and QUICK_B: a new quick save goes into the other slot and the old one is
      * deleted only once the new one is complete. QEMU's savevm deletes a snapshot of the same name
@@ -2179,7 +2209,13 @@ final class Guest {
         Map<String, String> env = new java.util.HashMap<>(System.getenv());
         Emu.baseEnv(c, links, env);
         env.put("ASOFT_FRAME_FD", String.valueOf(frameFd));
-        env.put("VK_DRIVER_FILES", icd.getPath());
+        if (GpuCheck.systemDriver(c)) {
+            // no Adreno: the phone's own driver passed the GPU check (a Pixel 10's PowerVR); Turnip is not for it
+            env.put("LD_LIBRARY_PATH", systemVulkanDir(c).getPath() + ":" + links.getPath());
+            AppLog.note(c, "gpu: the phone's own Vulkan driver (/system/lib64/libvulkan.so, ro.hardware " + android.os.Build.HARDWARE + ")");
+        } else {
+            env.put("VK_DRIVER_FILES", icd.getPath());
+        }
         env.put("REIMS_VGPU_LOG", "info");
         env.put("RUST_BACKTRACE", "1");
         env.put("ASOFT_PAGE_BITS", "14");

@@ -24,6 +24,10 @@ Nothing in it is specific to the S25 Ultra; it is the phone it is developed and 
 - Mali GPUs (most Exynos and MediaTek phones) have no Vulkan driver the GPU path works with yet: iOS
   26 and watchOS do not run there, iOS 16 does (it draws on the CPU). Set up's GPU check says so
   before anything is downloaded.
+- PowerVR GPUs (the Pixel 10's Tensor G5, a DXT-48-1536) have no Turnip either: there the GPU check
+  probes the phone's own Vulkan driver, and when it passes the same tests (or lacks only sparse binds,
+  as the compatibility mode allows) iOS 26 and watchOS run on that driver instead of Turnip. Untested
+  on a Pixel 10 so far; a system update checks again.
 - Speed is mostly the CPU's big cores: an older or smaller core is slower whatever its ARM version.
 - RAM: iOS 16 reached its lock screen on a 6 GB phone (Galaxy M31) with about 0.2 GB left to Android;
   with less to spare, Android may close it. iOS 26 and watchOS have been run only on a 12 GB phone.
