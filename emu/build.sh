@@ -14,6 +14,12 @@ REIMS_REV=d011826e7660601710274bbbe0359806cbf584ab
 M2V_REV=05d1bdaa5760686d8fd305c114b9361291f0bd9b
 TC=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
 export PATH=$TC:$PATH
+# our own compiler wrappers (the NDK's per-API ones are not relied on)
+mkdir -p "$W/bin"
+ls "$TC" | grep -i -E "android|^clang" | head -20 || true
+printf '#!/bin/sh\nexec "%s/clang" --target=aarch64-linux-android%s "$@"\n' "$TC" "$API" > "$W/bin/a64-clang"
+printf '#!/bin/sh\nexec "%s/clang++" --target=aarch64-linux-android%s "$@"\n' "$TC" "$API" > "$W/bin/a64-clang++"
+chmod +x "$W/bin/a64-clang" "$W/bin/a64-clang++"
 
 fetch() {   # dir repo rev patches
     if [ ! -d "$W/$1/.git" ]; then
@@ -62,9 +68,9 @@ fi
 ls "$P/lib" | tr '\n' ' '; echo
 
 # -- reims-vgpu with metal2vulkan: the static archive and its pkg-config file -------------------
-export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TC/aarch64-linux-android$API-clang
-export CC_aarch64_linux_android=$TC/aarch64-linux-android$API-clang
-export CXX_aarch64_linux_android=$TC/aarch64-linux-android$API-clang++
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$W/bin/a64-clang
+export CC_aarch64_linux_android=$W/bin/a64-clang
+export CXX_aarch64_linux_android=$W/bin/a64-clang++
 export AR_aarch64_linux_android=$TC/llvm-ar
 # the library's inline atomics (ldapr, ldsetal) are ARMv8.2's: every phone iOS 26 runs on has them
 export RUSTFLAGS="-C target-feature=+lse,+rcpc"
@@ -103,7 +109,7 @@ B=$W/qemu-build
 rm -rf "$B" && mkdir -p "$B" && cd "$B"
 AR=$TC/llvm-ar NM=$TC/llvm-nm OBJCOPY=$TC/llvm-objcopy RANLIB=$TC/llvm-ranlib STRIP=$TC/llvm-strip PKG_CONFIG=$W/pkg-config \
 "$W/qemu/configure" --target-list=aarch64-softmmu --cross-prefix=aarch64-linux-android- --cpu=aarch64 \
-    --cc="$TC/aarch64-linux-android$API-clang" --cxx="$TC/aarch64-linux-android$API-clang++" --host-cc=gcc \
+    --cc="$W/bin/a64-clang" --cxx="$W/bin/a64-clang++" --host-cc=gcc \
     --extra-cflags="-O2 -fno-emulated-tls -I$P/include" --extra-ldflags="-L$P/lib -Wl,-rpath-link,$P/lib" \
     --enable-reims-vgpu --disable-docs --disable-werror --disable-guest-agent --disable-tools \
     --disable-vnc-sasl --disable-linux-aio --disable-linux-io-uring --disable-kvm \
