@@ -1,0 +1,77 @@
+# A test APK of this fork's code for a phone without an Adreno (the Pixel 10's PowerVR).
+# The repository leaves out QEMU, Turnip, the Vulkan loader (jniLibs, jniLibs26) and the setup's helper
+# files (assets/helper, xnu, setup): the upstream author pulls them from his own builds. Here they come
+# out of upstream's latest release APK; only the Java and C of this fork are built.
+# The APK is com.asoft.ios.dev (a debug build, -PasoftDev): it installs beside the official app and
+# is signed with ci/debug.keystore, so every build installs over the last one.
+name: Pixel 10 test APK
+
+on:
+  push:
+    branches: [pixel10-system-vulkan]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android NDK and CMake
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;29.0.13846066" "cmake;3.22.1" "platforms;android-36" > /dev/null
+
+      - name: Upstream's prebuilt libraries and setup files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p up
+          gh release download --repo alpersamur3/asoft-ios-android --pattern '*.apk' --dir up
+          apk=$(ls up/*.apk | head -1)
+          echo "from $apk"
+          mkdir -p x && unzip -q "$apk" 'lib/arm64-v8a/*' 'assets/*' -d x
+          out=app/src/main/jniLibs/arm64-v8a
+          mkdir -p "$out"
+          for f in x/lib/arm64-v8a/*.so; do
+            case "$(basename "$f")" in
+              # built here from this fork's source, or brought by a Gradle dependency
+              librender.so|libgpucheck.so|libunpack.so|libconscrypt_jni.so) ;;
+              *) cp "$f" "$out/" ;;
+            esac
+          done
+          for d in helper xnu setup; do
+            if [ -d "x/assets/$d" ]; then
+              mkdir -p app/src/main/assets && cp -r "x/assets/$d" app/src/main/assets/
+            fi
+          done
+          ls -la "$out"
+
+      - name: Build
+        run: |
+          mkdir -p ~/.android && cp ci/debug.keystore ~/.android/debug.keystore
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug -PasoftDev
+          cp app/build/outputs/apk/debug/*.apk asoft-ios-pixel10-test.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asoft-ios-pixel10-test
+          path: asoft-ios-pixel10-test.apk
+
+      - name: Release for the phone
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=pixel10-test-${{ github.run_number }}
+          gh release create "$tag" asoft-ios-pixel10-test.apk --prerelease --target "${{ github.sha }}" \
+            --title "Pixel 10 test build ${{ github.run_number }}" \
+            --notes "Test APK (com.asoft.ios.dev, installs beside the official app) with the phone's own Vulkan driver on a phone without an Adreno. Open Set up and run the GPU check."
