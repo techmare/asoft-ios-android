@@ -16,7 +16,6 @@ TC=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
 export PATH=$TC:$PATH
 # our own compiler wrappers (the NDK's per-API ones are not relied on)
 mkdir -p "$W/bin"
-ls "$TC" | grep -i -E "android|^clang" | head -20 || true
 printf '#!/bin/sh\nexec "%s/clang" --target=aarch64-linux-android%s "$@"\n' "$TC" "$API" > "$W/bin/a64-clang"
 printf '#!/bin/sh\nexec "%s/clang++" --target=aarch64-linux-android%s "$@"\n' "$TC" "$API" > "$W/bin/a64-clang++"
 chmod +x "$W/bin/a64-clang" "$W/bin/a64-clang++"

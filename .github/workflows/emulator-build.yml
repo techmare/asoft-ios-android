@@ -20,7 +20,9 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ninja-build pkg-config python3-venv python3-pip libglib2.0-dev flex bison > /dev/null
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;29.0.13846066" > /dev/null
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;29.0.13846066" | tail -3
+          ls "$ANDROID_HOME/ndk/29.0.13846066/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
           rustup toolchain install 1.98.1 --profile minimal --target aarch64-linux-android
           rustup default 1.98.1
       - name: Upstream's APK (its libraries are linked against)
