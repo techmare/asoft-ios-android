@@ -357,7 +357,7 @@ final class GpuCheck {
         c.startService(new Intent(c, GpuCheckService.class).setAction(which));
         long t0 = System.currentTimeMillis();
         boolean seenPid = false;
-        while (System.currentTimeMillis() - t0 < 90_000) {
+        while (System.currentTimeMillis() - t0 < 240_000) {
             String res = resultOf(log);
             if (res != null) {
                 return res;
@@ -383,7 +383,7 @@ final class GpuCheck {
                 return "stopped";
             }
         }
-        appendLine(log, "error: no result in 90 s" + (seenPid ? " (the driver hangs)" : " (the probe did not start)"));
+        appendLine(log, "error: no result in 240 s" + (seenPid ? " (the driver hangs)" : " (the probe did not start)"));
         appendLine(log, "result: fail");
         return "timeout";
     }

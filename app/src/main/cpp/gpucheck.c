@@ -21,6 +21,8 @@
 #include <android/hardware_buffer.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/dma-buf.h>
+#include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
 #include <dlfcn.h>
@@ -696,6 +698,41 @@ static double now_ms(void)
     return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
 }
 
+/* how the CPU and the GPU are kept in step over the shared pages: 0 nothing (the first run's stale words looked
+   like the CPU's caches), 1 the CPU's own cache instructions over the range (DC CIVAC, which Linux lets an app
+   run), 2 the dma-buf's sync ioctl around the CPU's access (the whole buffer: the kernel's own flush) */
+static int flush_mode;
+static int sync_fd = -1;
+static double flush_ms;
+
+static void cache_flush(void *p, size_t len)
+{
+#if defined(__aarch64__)
+    uint64_t ctr;
+    __asm__("mrs %0, ctr_el0" : "=r"(ctr));
+    size_t line = 4u << ((ctr >> 16) & 15);
+    for (uintptr_t a = (uintptr_t)p & ~(line - 1); a < (uintptr_t)p + len; a += line) {
+        __asm__ volatile("dc civac, %0" : : "r"(a) : "memory");
+    }
+    __asm__ volatile("dsb ish" : : : "memory");
+#endif
+}
+
+/* before (start=1) or after (start=0) the CPU touches the range */
+static void cpu_access(int start, int write, void *p, size_t len)
+{
+    double t0 = now_ms();
+    if (flush_mode == 1) {
+        cache_flush(p, len);
+    } else if (flush_mode == 2 && sync_fd >= 0) {
+        struct dma_buf_sync sy = {.flags = (start ? DMA_BUF_SYNC_START : DMA_BUF_SYNC_END) | (write ? DMA_BUF_SYNC_WRITE : DMA_BUF_SYNC_READ)};
+        if (ioctl(sync_fd, DMA_BUF_IOCTL_SYNC, &sy)) {
+            say("  dma-buf sync: errno %d", errno);
+        }
+    }
+    flush_ms += now_ms() - t0;
+}
+
 typedef struct {
     int version, numFds, numInts;
     int data[];
@@ -703,8 +740,8 @@ typedef struct {
 
 /* a buffer of @len bytes bound at @off inside @mem; the GPU writes it, @cpu (the same bytes) reads it; then
    the CPU writes and a copy to a plain buffer reads. 1 when both directions agree. */
-static int ahb_roundtrip(const char *tag, VkDeviceMemory mem, VkExternalMemoryHandleTypeFlags type, VkDeviceSize off,
-                         uint32_t *cpu)
+static int ahb_roundtrip1(const char *tag, VkDeviceMemory mem, VkExternalMemoryHandleTypeFlags type, VkDeviceSize off,
+                          uint32_t *cpu)
 {
     DFN(vkCreateBuffer);
     DFN(vkBindBufferMemory);
@@ -726,19 +763,28 @@ static int ahb_roundtrip(const char *tag, VkDeviceMemory mem, VkExternalMemoryHa
         say("%s: vkBindBufferMemory at offset %llu VkResult %d", tag, (unsigned long long)off, r);
         return 0;
     }
+    flush_ms = 0;
+    cpu_access(1, 1, cpu, len);
     memset(cpu, 0, len);
+    cpu_access(0, 1, cpu, len);
     if (compute_into(b, n) != VK_SUCCESS) {
         say("%s: the compute dispatch failed", tag);
         return 0;
     }
+    cpu_access(1, 0, cpu, len);
     uint32_t bad = wrong_words(cpu, n);
-    say("%s: GPU to CPU at offset %llu MiB: %u of %u words wrong", tag, (unsigned long long)(off >> 20), bad, n);
+    cpu_access(0, 0, cpu, len);
+    say("%s: flush %d: GPU to CPU at offset %llu MiB: %u of %u words wrong (flushes %.1f ms)", tag, flush_mode,
+        (unsigned long long)(off >> 20), bad, n, flush_ms);
+    flush_ms = 0;
     /* the CPU's writes, with the mapping kept: twice, the second with no unmap or flush between */
     uint32_t bad2 = 0;
     for (int round = 0; round < 2; round++) {
+        cpu_access(1, 1, cpu, len);
         for (uint32_t i = 0; i < n; i++) {
             cpu[i] = i * 7 + 5 + (uint32_t)round;
         }
+        cpu_access(0, 1, cpu, len);
         VkBuffer pb;
         VkDeviceMemory pm;
         void *map;
@@ -756,9 +802,28 @@ static int ahb_roundtrip(const char *tag, VkDeviceMemory mem, VkExternalMemoryHa
             bad2 += v[i] != i * 7 + 5 + (uint32_t)round;
         }
     }
-    say("%s: CPU to GPU (2 rounds, mapping kept): %u of %u words wrong", tag, bad2, n * 2);
+    say("%s: flush %d: CPU to GPU (2 rounds, mapping kept): %u of %u words wrong (flushes %.1f ms)", tag, flush_mode, bad2, n * 2,
+        flush_ms);
     vkDestroyBuffer(dev, b, NULL);
     return bad == 0 && bad2 == 0;
+}
+
+/* every way of keeping in step, each twice (a stale cache is a matter of chance); bit m set when mode m was right both times */
+static int ahb_roundtrip(const char *tag, VkDeviceMemory mem, VkExternalMemoryHandleTypeFlags type, VkDeviceSize off,
+                         uint32_t *cpu)
+{
+    int ok = 0;
+    for (flush_mode = 0; flush_mode < 3; flush_mode++) {
+        if (flush_mode == 2 && sync_fd < 0) {
+            continue;
+        }
+        int a = ahb_roundtrip1(tag, mem, type, off, cpu);
+        int b = ahb_roundtrip1(tag, mem, type, off, cpu);
+        ok |= (a && b) << flush_mode;
+    }
+    flush_mode = 0;
+    say("%s: right with no flush %d, with the CPU's cache flush %d, with the dma-buf sync %d", tag, ok & 1, (ok >> 1) & 1, (ok >> 2) & 1);
+    return ok;
 }
 
 /* one BLOB buffer of @size bytes: allocated, locked, imported whole; 0 when a step fails */
@@ -785,6 +850,10 @@ static int ahb_one(uint64_t size, int with_fd)
     rc = AHardwareBuffer_lock(hb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, NULL, &cpu);
     say("%s: AHardwareBuffer_lock %d, pointer %s (%.0f ms)", tag, rc, cpu ? "given" : "null", now_ms() - t0);
     VkDeviceSize last = (size - (4u << 20)) & ~(VkDeviceSize)0xffff;      /* a 4 MiB buffer at its end */
+    void *nw = dlopen("libnativewindow.so", RTLD_NOW);
+    const handle_t *(*get)(const AHardwareBuffer *) = nw ? dlsym(nw, "AHardwareBuffer_getNativeHandle") : NULL;
+    const handle_t *h = get ? get(hb) : NULL;
+    sync_fd = h && h->numFds > 0 ? h->data[0] : -1;
     if (!rc && cpu && ahb_ext && vkGetAndroidHardwareBufferPropertiesANDROID) {
         VkAndroidHardwareBufferPropertiesANDROID hp = {.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID};
         VkResult r = vkGetAndroidHardwareBufferPropertiesANDROID(dev, hb, &hp);
@@ -814,9 +883,6 @@ static int ahb_one(uint64_t size, int with_fd)
     }
     /* its dma-buf: mapped at an offset beside the lock, then imported as a dma-buf */
     if (with_fd && !rc && cpu) {
-        void *nw = dlopen("libnativewindow.so", RTLD_NOW);
-        const handle_t *(*get)(const AHardwareBuffer *) = nw ? dlsym(nw, "AHardwareBuffer_getNativeHandle") : NULL;
-        const handle_t *h = get ? get(hb) : NULL;
         say("%s: native handle %s, fds %d, ints %d", tag, !get ? "function not found" : h ? "given" : "null", h ? h->numFds : 0,
             h ? h->numInts : 0);
         if (h && h->numFds > 0) {
@@ -854,7 +920,7 @@ static int ahb_one(uint64_t size, int with_fd)
                             char t2[96];
                             snprintf(t2, sizeof t2, "%s dma-buf", tag);
                             int k = ahb_roundtrip(t2, m, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, off, twin);
-                            say("ahb verdict: dma-buf route %s", k ? "works" : "fails");
+                            say("ahb verdict: dma-buf route: modes right %#x (1 none, 2 cache flush, 4 sync)", k);
                             vkFreeMemory(dev, m, NULL);
                         } else {
                             close(imp.fd);
@@ -869,6 +935,7 @@ static int ahb_one(uint64_t size, int with_fd)
     if (cpu) {
         AHardwareBuffer_unlock(hb, NULL);
     }
+    sync_fd = -1;
     AHardwareBuffer_release(hb);
     return ok;
 }
@@ -882,13 +949,11 @@ static void test_ahb(void)
     }
     say("ahb: extensions: hardware buffer import %d, dma-buf import %d", ahb_ext, dmabuf_ext);
     int small = ahb_one(64ull << 20, 1);
-    say("ahb verdict: hardware-buffer route (64 MiB) %s", small ? "works" : "fails");
+    say("ahb verdict: hardware-buffer route (64 MiB): modes right %#x (1 none, 2 cache flush, 4 sync)", small);
     int g1 = ahb_one(1ull << 30, 0);
-    say("ahb verdict: 1 GiB %s", g1 ? "works" : "fails");
-    if (g1) {
-        int g3 = ahb_one(3ull << 30, 0);
-        say("ahb verdict: 3 GiB %s", g3 ? "works" : "fails");
-    }
+    say("ahb verdict: 1 GiB: modes right %#x", g1);
+    int g3 = ahb_one(3ull << 30, 0);
+    say("ahb verdict: 3 GiB: modes right %#x", g3);
 }
 
 /* -- the check --------------------------------------------------------------------------------- */
