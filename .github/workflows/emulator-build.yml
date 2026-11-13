@@ -1,0 +1,45 @@
+# iOS 26's QEMU (libqemu26.so) built from the public sources with this fork's patches (emu/).
+name: Emulator (libqemu26.so)
+
+on:
+  push:
+    branches: [pixel10-system-vulkan]
+    paths: ['emu/**', '.github/workflows/emulator-build.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build pkg-config python3-venv python3-pip libglib2.0-dev flex bison > /dev/null
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;29.0.13846066" > /dev/null
+          rustup toolchain install 1.98.1 --profile minimal --target aarch64-linux-android
+          rustup default 1.98.1
+      - name: Upstream's APK (its libraries are linked against)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download --repo alpersamur3/asoft-ios-android --pattern '*.apk' --dir up
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ hashFiles('emu/build.sh') }}
+          restore-keys: cargo-
+      - name: Build
+        run: |
+          export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.13846066
+          emu/build.sh "$RUNNER_TEMP/emu" "$(ls up/*.apk | head -1)"
+          cp "$RUNNER_TEMP/emu/libqemu26.so" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libqemu26
+          path: libqemu26.so

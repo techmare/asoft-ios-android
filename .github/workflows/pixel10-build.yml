@@ -9,6 +9,7 @@ name: Pixel 10 test APK
 on:
   push:
     branches: [pixel10-system-vulkan]
+    paths-ignore: ['emu/**', '.github/workflows/emulator-build.yml']
   workflow_dispatch:
 
 permissions:
