@@ -122,8 +122,11 @@ AR=$TC/llvm-ar NM=$TC/llvm-nm OBJCOPY=$TC/llvm-objcopy RANLIB=$TC/llvm-ranlib ST
     --extra-cflags="-O2 -fno-emulated-tls -I$P/include" --extra-ldflags="-L$P/lib -L$W/stub -Wl,-rpath-link,$P/lib" \
     --enable-reims-vgpu --disable-docs --disable-werror --disable-guest-agent --disable-tools \
     --disable-vnc-sasl --disable-linux-aio --disable-linux-io-uring --disable-kvm \
+    --disable-vhost-user --disable-vhost-net --disable-vhost-kernel --disable-vhost-crypto --disable-vhost-vdpa \
+    --disable-vhost-user-blk-server \
     || { echo "== config.log"; tail -60 "$B/config.log" || true; echo "== meson-log"; tail -200 "$B/meson-logs/meson-log.txt" || true; exit 1; }
-ninja -C "$B" qemu-system-aarch64
+ninja -C "$B" -k 0 qemu-system-aarch64 > "$W/ninja.log" 2>&1 || { grep -E "FAILED|error:|undefined" "$W/ninja.log" | sort | uniq -c | sort -rn | head -80; tail -30 "$W/ninja.log"; exit 1; }
+tail -3 "$W/ninja.log"
 "$TC/llvm-strip" --strip-debug -o "$W/libqemu26.so" "$B/qemu-system-aarch64"
 ls -la "$W/libqemu26.so"
 "$TC/llvm-readelf" -d "$W/libqemu26.so" | grep NEEDED
