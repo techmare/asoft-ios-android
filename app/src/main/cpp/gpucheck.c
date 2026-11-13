@@ -17,6 +17,12 @@
  * VK_DRIVER_FILES); mode 1: the system's own loader and driver (libvulkan.so), for the log only.
  */
 #define VK_NO_PROTOTYPES
+#define VK_USE_PLATFORM_ANDROID_KHR
+#include <android/hardware_buffer.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <time.h>
+#include <unistd.h>
 #include <dlfcn.h>
 #include <jni.h>
 #include <stdarg.h>
@@ -670,6 +676,221 @@ static int test_sparse_image(void)
     return bad == 0;
 }
 
+/* -- hardware buffers: the route for a driver without VK_EXT_external_memory_host (a PowerVR) ----------
+ * For the log only, never a lack: could the guest's RAM be an AHardwareBuffer (a dma-buf Android gives an
+ * app) that the CPU keeps mapped and the GPU imports? Asked of the phone:
+ *   - /dev/udmabuf (reims' Linux dma-buf route): can an app open it?
+ *   - a BLOB buffer the CPU keeps locked, imported whole, with a small VkBuffer bound inside it at an
+ *     offset: do the GPU's writes show through the lock's pointer, and the CPU's writes reach the GPU?
+ *   - how large may one be (1 GiB, 3 GiB)?
+ *   - its dma-buf descriptor (AHardwareBuffer_getNativeHandle, not in the NDK's headers): can it be
+ *     mapped at an offset, and imported with VK_EXT_external_memory_dma_buf (metal2vulkan's own route)?
+ */
+
+static int ahb_ext, dmabuf_ext;
+
+static double now_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+}
+
+typedef struct {
+    int version, numFds, numInts;
+    int data[];
+} handle_t;
+
+/* a buffer of @len bytes bound at @off inside @mem; the GPU writes it, @cpu (the same bytes) reads it; then
+   the CPU writes and a copy to a plain buffer reads. 1 when both directions agree. */
+static int ahb_roundtrip(const char *tag, VkDeviceMemory mem, VkExternalMemoryHandleTypeFlags type, VkDeviceSize off,
+                         uint32_t *cpu)
+{
+    DFN(vkCreateBuffer);
+    DFN(vkBindBufferMemory);
+    DFN(vkCmdCopyBuffer);
+    DFN(vkDestroyBuffer);
+    uint32_t n = 1 << 20;                  /* 4 MiB */
+    VkDeviceSize len = (VkDeviceSize)n * 4;
+    VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, .handleTypes = type};
+    VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = len,
+                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT};
+    VkBuffer b;
+    VkResult r = vkCreateBuffer(dev, &bci, NULL, &b);
+    if (r != VK_SUCCESS) {
+        say("%s: vkCreateBuffer VkResult %d", tag, r);
+        return 0;
+    }
+    r = vkBindBufferMemory(dev, b, mem, off);
+    if (r != VK_SUCCESS) {
+        say("%s: vkBindBufferMemory at offset %llu VkResult %d", tag, (unsigned long long)off, r);
+        return 0;
+    }
+    memset(cpu, 0, len);
+    if (compute_into(b, n) != VK_SUCCESS) {
+        say("%s: the compute dispatch failed", tag);
+        return 0;
+    }
+    uint32_t bad = wrong_words(cpu, n);
+    say("%s: GPU to CPU at offset %llu MiB: %u of %u words wrong", tag, (unsigned long long)(off >> 20), bad, n);
+    /* the CPU's writes, with the mapping kept: twice, the second with no unmap or flush between */
+    uint32_t bad2 = 0;
+    for (int round = 0; round < 2; round++) {
+        for (uint32_t i = 0; i < n; i++) {
+            cpu[i] = i * 7 + 5 + (uint32_t)round;
+        }
+        VkBuffer pb;
+        VkDeviceMemory pm;
+        void *map;
+        if (plain_buffer(len, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &pb, &pm, &map) != VK_SUCCESS) {
+            return 0;
+        }
+        VkCommandBuffer cb = begin();
+        VkBufferCopy bc = {.size = len};
+        vkCmdCopyBuffer(cb, b, pb, 1, &bc);
+        if (submit(cb, "copy") != VK_SUCCESS) {
+            return 0;
+        }
+        const uint32_t *v = map;
+        for (uint32_t i = 0; i < n; i++) {
+            bad2 += v[i] != i * 7 + 5 + (uint32_t)round;
+        }
+    }
+    say("%s: CPU to GPU (2 rounds, mapping kept): %u of %u words wrong", tag, bad2, n * 2);
+    vkDestroyBuffer(dev, b, NULL);
+    return bad == 0 && bad2 == 0;
+}
+
+/* one BLOB buffer of @size bytes: allocated, locked, imported whole; 0 when a step fails */
+static int ahb_one(uint64_t size, int with_fd)
+{
+    DFN(vkGetAndroidHardwareBufferPropertiesANDROID);
+    DFN(vkAllocateMemory);
+    DFN(vkFreeMemory);
+    char tag[64];
+    snprintf(tag, sizeof tag, "ahb %llu MiB", (unsigned long long)(size >> 20));
+    AHardwareBuffer_Desc d = {.width = (uint32_t)size, .height = 1, .layers = 1, .format = AHARDWAREBUFFER_FORMAT_BLOB,
+                              .usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN
+                                       | AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER};
+    AHardwareBuffer *hb = NULL;
+    double t0 = now_ms();
+    int rc = AHardwareBuffer_allocate(&d, &hb);
+    say("%s: AHardwareBuffer_allocate %d (%.0f ms)", tag, rc, now_ms() - t0);
+    if (rc || !hb) {
+        return 0;
+    }
+    int ok = 0;
+    void *cpu = NULL;
+    t0 = now_ms();
+    rc = AHardwareBuffer_lock(hb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, NULL, &cpu);
+    say("%s: AHardwareBuffer_lock %d, pointer %s (%.0f ms)", tag, rc, cpu ? "given" : "null", now_ms() - t0);
+    VkDeviceSize last = (size - (4u << 20)) & ~(VkDeviceSize)0xffff;      /* a 4 MiB buffer at its end */
+    if (!rc && cpu && ahb_ext && vkGetAndroidHardwareBufferPropertiesANDROID) {
+        VkAndroidHardwareBufferPropertiesANDROID hp = {.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID};
+        VkResult r = vkGetAndroidHardwareBufferPropertiesANDROID(dev, hb, &hp);
+        say("%s: vulkan properties VkResult %d, allocationSize %llu, memory types %#x", tag, r,
+            (unsigned long long)hp.allocationSize, hp.memoryTypeBits);
+        uint32_t t = 0;
+        while (t < 32 && !(hp.memoryTypeBits & (1u << t))) {
+            t++;
+        }
+        if (r == VK_SUCCESS && t < 32) {
+            VkImportAndroidHardwareBufferInfoANDROID imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID,
+                                                            .buffer = hb};
+            VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp,
+                                       .allocationSize = hp.allocationSize, .memoryTypeIndex = t};
+            VkDeviceMemory m;
+            t0 = now_ms();
+            r = vkAllocateMemory(dev, &ai, NULL, &m);
+            say("%s: import VkResult %d (%.0f ms)", tag, r, now_ms() - t0);
+            if (r == VK_SUCCESS) {
+                char t2[96];
+                snprintf(t2, sizeof t2, "%s import", tag);
+                ok = ahb_roundtrip(t2, m, VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID, last,
+                                   (uint32_t *)((uint8_t *)cpu + last));
+                vkFreeMemory(dev, m, NULL);
+            }
+        }
+    }
+    /* its dma-buf: mapped at an offset beside the lock, then imported as a dma-buf */
+    if (with_fd && !rc && cpu) {
+        void *nw = dlopen("libnativewindow.so", RTLD_NOW);
+        const handle_t *(*get)(const AHardwareBuffer *) = nw ? dlsym(nw, "AHardwareBuffer_getNativeHandle") : NULL;
+        const handle_t *h = get ? get(hb) : NULL;
+        say("%s: native handle %s, fds %d, ints %d", tag, !get ? "function not found" : h ? "given" : "null", h ? h->numFds : 0,
+            h ? h->numInts : 0);
+        if (h && h->numFds > 0) {
+            int fd = h->data[0];
+            off_t end = lseek(fd, 0, SEEK_END);
+            say("%s: dma-buf size %lld", tag, (long long)end);
+            VkDeviceSize off = 32u << 20;
+            uint32_t *twin = mmap(NULL, 4u << 20, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)off);
+            if (twin == MAP_FAILED) {
+                say("%s: mmap of the dma-buf at an offset: errno %d", tag, errno);
+            } else {
+                twin[5] = 0x1234abcd;
+                uint32_t seen = ((uint32_t *)((uint8_t *)cpu + off))[5];
+                say("%s: mmap of the dma-buf at an offset: %s", tag, seen == 0x1234abcd ? "the same pages as the lock" : "other pages");
+                if (dmabuf_ext) {
+                    DFN(vkGetMemoryFdPropertiesKHR);
+                    VkMemoryFdPropertiesKHR fp = {.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+                    VkResult r = vkGetMemoryFdPropertiesKHR
+                                     ? vkGetMemoryFdPropertiesKHR(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fp)
+                                     : VK_ERROR_EXTENSION_NOT_PRESENT;
+                    say("%s: dma-buf fd properties VkResult %d, memory types %#x", tag, r, fp.memoryTypeBits);
+                    for (uint32_t t = 0; r == VK_SUCCESS && t < 32; t++) {
+                        VkMemoryPropertyFlags fl = t < mp.memoryTypeCount ? mp.memoryTypes[t].propertyFlags : 0;
+                        if (!(fp.memoryTypeBits & (1u << t)) || !(fl & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+                            continue;
+                        }
+                        VkImportMemoryFdInfoKHR imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+                                                       .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, .fd = dup(fd)};
+                        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp,
+                                                   .allocationSize = (VkDeviceSize)end, .memoryTypeIndex = t};
+                        VkDeviceMemory m;
+                        r = vkAllocateMemory(dev, &ai, NULL, &m);
+                        say("%s: dma-buf import as type %u VkResult %d", tag, t, r);
+                        if (r == VK_SUCCESS) {
+                            char t2[96];
+                            snprintf(t2, sizeof t2, "%s dma-buf", tag);
+                            int k = ahb_roundtrip(t2, m, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, off, twin);
+                            say("ahb verdict: dma-buf route %s", k ? "works" : "fails");
+                            vkFreeMemory(dev, m, NULL);
+                        } else {
+                            close(imp.fd);
+                        }
+                        break;
+                    }
+                }
+                munmap(twin, 4u << 20);
+            }
+        }
+    }
+    if (cpu) {
+        AHardwareBuffer_unlock(hb, NULL);
+    }
+    AHardwareBuffer_release(hb);
+    return ok;
+}
+
+static void test_ahb(void)
+{
+    int u = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+    say("udmabuf: %s (errno %d)", u >= 0 ? "opens" : "does not open", u >= 0 ? 0 : errno);
+    if (u >= 0) {
+        close(u);
+    }
+    say("ahb: extensions: hardware buffer import %d, dma-buf import %d", ahb_ext, dmabuf_ext);
+    int small = ahb_one(64ull << 20, 1);
+    say("ahb verdict: hardware-buffer route (64 MiB) %s", small ? "works" : "fails");
+    int g1 = ahb_one(1ull << 30, 0);
+    say("ahb verdict: 1 GiB %s", g1 ? "works" : "fails");
+    if (g1) {
+        int g3 = ahb_one(3ull << 30, 0);
+        say("ahb verdict: 3 GiB %s", g3 ? "works" : "fails");
+    }
+}
+
 /* -- the check --------------------------------------------------------------------------------- */
 
 static const char *vendor(uint32_t id)
@@ -922,10 +1143,22 @@ static int check(const char *loader)
         {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = gfx_family, .queueCount = 1, .pQueuePriorities = &prio},
         {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = sparse_family, .queueCount = 1, .pQueuePriorities = &prio}};
     uint32_t nqci = sparse_family != UINT32_MAX && sparse_family != gfx_family ? 2 : 1;
-    const char *want[2];
+    const char *want[8];
     uint32_t nwant = 0;
     if (host_ext) {
         want[nwant++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+    } else {
+        /* for test_ahb (the log only); a device with the host import is made as it always was */
+        if (has_ext(ext, ne, "VK_ANDROID_external_memory_android_hardware_buffer") && has_ext(ext, ne, "VK_EXT_queue_family_foreign")) {
+            want[nwant++] = "VK_ANDROID_external_memory_android_hardware_buffer";
+            want[nwant++] = "VK_EXT_queue_family_foreign";
+            ahb_ext = 1;
+        }
+        if (has_ext(ext, ne, "VK_KHR_external_memory_fd") && has_ext(ext, ne, "VK_EXT_external_memory_dma_buf")) {
+            want[nwant++] = "VK_KHR_external_memory_fd";
+            want[nwant++] = "VK_EXT_external_memory_dma_buf";
+            dmabuf_ext = 1;
+        }
     }
     VkPhysicalDeviceFeatures en = {.sparseBinding = f->sparseBinding, .sparseResidencyBuffer = f->sparseResidencyBuffer};
     VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = nqci, .pQueueCreateInfos = qci,
@@ -972,6 +1205,9 @@ static int check(const char *loader)
                 say("recommended, absent: sparse linear images from host memory (heap textures are copied instead)");
             }
         }
+    } else {
+        say("note: hardware-buffer tests (for the log: a route without VK_EXT_external_memory_host)");
+        test_ahb();
     }
     return failed;
 }

@@ -8,7 +8,7 @@ target_link_libraries(render android log EGL GLESv3)
 # the GPU check (GpuCheck.java, its own process): loads a Vulkan loader with dlopen, links none
 add_library(gpucheck SHARED gpucheck.c)
 target_compile_options(gpucheck PRIVATE -O2 -Wall)
-target_link_libraries(gpucheck dl)
+target_link_libraries(gpucheck dl nativewindow)
 
 # the setup from Apple's native help (Unpack.java): Apple's LZFSE decoder (lzfse/, BSD-3-Clause) for AEA
 # segments and IM4P payloads, and hole punching behind a decrypt
