@@ -58,6 +58,8 @@ jobs:
       - name: Build
         run: |
           mkdir -p ~/.android && cp ci/debug.keystore ~/.android/debug.keystore
+          # gradle.properties points at the upstream author's Windows JDK
+          sed -i '/^org.gradle.java.home/d' gradle.properties
           chmod +x gradlew
           ./gradlew --no-daemon assembleDebug -PasoftDev
           cp app/build/outputs/apk/debug/*.apk asoft-ios-pixel10-test.apk
