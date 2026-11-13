@@ -66,6 +66,8 @@ export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TC/aarch64-linux-android$API-c
 export CC_aarch64_linux_android=$TC/aarch64-linux-android$API-clang
 export CXX_aarch64_linux_android=$TC/aarch64-linux-android$API-clang++
 export AR_aarch64_linux_android=$TC/llvm-ar
+# the library's inline atomics (ldapr, ldsetal) are ARMv8.2's: every phone iOS 26 runs on has them
+export RUSTFLAGS="-C target-feature=+lse,+rcpc"
 D=$W/dist
 mkdir -p "$D/lib/pkgconfig" "$D/include"
 (cd "$W/reims-vgpu" && rustup target add aarch64-linux-android >/dev/null &&
