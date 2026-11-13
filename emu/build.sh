@@ -107,7 +107,7 @@ AR=$TC/llvm-ar NM=$TC/llvm-nm OBJCOPY=$TC/llvm-objcopy RANLIB=$TC/llvm-ranlib ST
     --extra-cflags="-O2 -fno-emulated-tls -I$P/include" --extra-ldflags="-L$P/lib -Wl,-rpath-link,$P/lib" \
     --enable-reims-vgpu --disable-docs --disable-werror --disable-guest-agent --disable-tools \
     --disable-vnc-sasl --disable-linux-aio --disable-linux-io-uring --disable-kvm \
-    || { tail -150 "$B/meson-logs/meson-log.txt" 2>/dev/null; cat "$B/config.log" 2>/dev/null | tail -60; exit 1; }
+    || { echo "== config.log"; tail -60 "$B/config.log" || true; echo "== meson-log"; tail -200 "$B/meson-logs/meson-log.txt" || true; exit 1; }
 ninja -C "$B" qemu-system-aarch64
 "$TC/llvm-strip" --strip-debug -o "$W/libqemu26.so" "$B/qemu-system-aarch64"
 ls -la "$W/libqemu26.so"
