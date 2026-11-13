@@ -104,12 +104,22 @@ esac
 PKG_CONFIG_SYSROOT_DIR=$R PKG_CONFIG_LIBDIR=$P/lib/pkgconfig:$P/share/pkgconfig exec /usr/bin/pkg-config "\$@"
 SH
 chmod +x "$W/pkg-config"
+# bionic has no shm_open (and no librt): QEMU asks for the library where the function is missing. The app
+# starts no memory-backend-shm; the stub says so to whoever would.
+mkdir -p "$W/stub"
+cat > "$W/stub/rt.c" <<'C'
+#include <errno.h>
+#include <sys/types.h>
+int shm_open(const char *name, int oflag, mode_t mode) { (void)name; (void)oflag; (void)mode; errno = ENOSYS; return -1; }
+int shm_unlink(const char *name) { (void)name; errno = ENOSYS; return -1; }
+C
+"$W/bin/a64-clang" -O2 -c -o "$W/stub/rt.o" "$W/stub/rt.c" && "$TC/llvm-ar" rcs "$W/stub/librt.a" "$W/stub/rt.o"
 B=$W/qemu-build
 rm -rf "$B" && mkdir -p "$B" && cd "$B"
 AR=$TC/llvm-ar NM=$TC/llvm-nm OBJCOPY=$TC/llvm-objcopy RANLIB=$TC/llvm-ranlib STRIP=$TC/llvm-strip PKG_CONFIG=$W/pkg-config \
 "$W/qemu/configure" --target-list=aarch64-softmmu --cross-prefix=aarch64-linux-android- --cpu=aarch64 \
     --cc="$W/bin/a64-clang" --cxx="$W/bin/a64-clang++" --host-cc=gcc \
-    --extra-cflags="-O2 -fno-emulated-tls -I$P/include" --extra-ldflags="-L$P/lib -Wl,-rpath-link,$P/lib" \
+    --extra-cflags="-O2 -fno-emulated-tls -I$P/include" --extra-ldflags="-L$P/lib -L$W/stub -Wl,-rpath-link,$P/lib" \
     --enable-reims-vgpu --disable-docs --disable-werror --disable-guest-agent --disable-tools \
     --disable-vnc-sasl --disable-linux-aio --disable-linux-io-uring --disable-kvm \
     || { echo "== config.log"; tail -60 "$B/config.log" || true; echo "== meson-log"; tail -200 "$B/meson-logs/meson-log.txt" || true; exit 1; }
